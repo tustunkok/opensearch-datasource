@@ -45,6 +45,15 @@ export const PPLQueryField = (props: CodeEditorProps) => {
   const disposalRef = useRef<monacoTypes.IDisposable>();
   const editorRef = useRef<monacoTypes.editor.IStandaloneCodeEditor>();
 
+  // The Shift+Enter command is registered once, on editor mount, so it has to read the latest
+  // query through a ref. Closing over `query` instead would spread a stale object and silently
+  // drop fields that change after mount — most notably the selected `format`. The ref is synced
+  // in an effect rather than during render, which React forbids.
+  const queryRef = useRef(query);
+  useEffect(() => {
+    queryRef.current = query;
+  }, [query]);
+
   // Keep the Monaco editor in sync when query.query is updated externally (e.g. by the IndexPicker)
   useEffect(() => {
     const editor = editorRef.current;
@@ -88,12 +97,12 @@ export const PPLQueryField = (props: CodeEditorProps) => {
       editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => {
         const text = editor.getValue();
         onChange({
-          ...query,
+          ...queryRef.current,
           query: text,
         });
       });
     },
-    [onChange, query]
+    [onChange]
   );
   const onBeforeEditorMount = async (monaco: Monaco) => {
     disposalRef.current = await registerLanguage(monaco, language, datasource.pplCompletionItemProvider);
