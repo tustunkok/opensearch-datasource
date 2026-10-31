@@ -1,0 +1,293 @@
+name: Release (fork build)
+
+# Builds an installable plugin package from any branch and publishes it as a
+# GitHub release on this repository.
+#
+# This is a fork-only helper: it does not require Grafana's Vault, OIDC or
+# catalog credentials, so it works outside the grafana org. The resulting
+# package is UNSIGNED and will only load in Grafana when unsigned plugins are
+# permitted (app_mode = development, or the plugin id listed in
+# allow_loading_unsigned_plugins).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Plugin version to stamp into the package, e.g. 2.34.7+custom.2.
+          Leave empty to derive <package.json version>+<short sha>.
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: >
+          Git tag to create for the release. Leave empty to derive from the
+          resolved version as v<version>.
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: Mark the published release as a pre-release.
+        required: false
+        type: boolean
+        default: false
+      dry-run:
+        description: >
+          Build and package, but do not create a git tag or a GitHub release.
+          The package is still uploaded as a workflow artifact.
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # create the tag and the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            # strip any existing build metadata so the result stays valid semver
+            base=$(jq -r .version package.json | cut -d+ -f1)
+            version="${base}+$(git rev-parse --short=7 HEAD)"
+          fi
+
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="v${version}"
+          fi
+
+          # A value containing a newline or a space would break the release command.
+          case "${version}${tag}" in
+            *[[:space:]]*) echo "::error::version and tag must not contain whitespace"; exit 1 ;;
+          esac
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${version} (tag: ${tag})"
+
+      - name: Stamp plugin version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # webpack substitutes %VERSION% in plugin.json from package.json, so the
+          # version has to be applied before the frontend build. `npm version` is not
+          # used because it drops semver build metadata (2.34.7+custom.2 becomes
+          # 2.34.7), which is exactly what a fork build needs to keep.
+          for file in package.json package-lock.json; do
+            tmp=$(mktemp)
+            jq --arg v "${VERSION}" '.version = $v' "${file}" > "${tmp}"
+            mv "${tmp}" "${file}"
+          done
+          jq -r .version package.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build backend
+        run: |
+          set -euo pipefail
+          go install github.com/magefile/mage@v1.17.2
+          "$(go env GOPATH)/bin/mage" -v
+
+      - name: Verify build output
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          built=$(jq -r .info.version dist/plugin.json)
+          if [ "${built}" != "${VERSION}" ]; then
+            echo "::error::dist/plugin.json reports version '${built}', expected '${VERSION}'"
+            exit 1
+          fi
+
+          # Grafana has to exec these, so a lost executable bit breaks the install
+          # with "fork/exec ...: permission denied".
+          shopt -s nullglob
+          bins=(dist/gpx_opensearch-datasource_*)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "::error::no backend binaries found in dist/"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            if [ ! -x "${bin}" ]; then
+              echo "::error::${bin} is not executable"
+              exit 1
+            fi
+          done
+          echo "Versions and executable bits OK (${#bins[@]} binaries)"
+
+      - name: Package universal ZIP
+        id: package
+        uses: grafana/plugin-ci-workflows/actions/internal/plugins/package@ci-cd-workflows/v12.0.1
+        with:
+          universal: 'true'
+          dist-folder: dist
+          output-folder: dist-artifacts
+          access-policy-token: ''
+          allow-unsigned: 'true'
+
+      - name: Verify package
+        env:
+          ZIP_NAME: ${{ steps.package.outputs.zip }}
+        run: |
+          set -euo pipefail
+          zip_path="dist-artifacts/${ZIP_NAME}"
+          test -f "${zip_path}"
+
+          # The archive must contain a top-level plugin folder (the layout the install
+          # instructions assume) and keep the executable bit on the backend binaries.
+          unzip -Z -l "${zip_path}" | grep -qE '^d.*grafana-opensearch-datasource/$' || {
+            echo "::error::${ZIP_NAME} has no top-level plugin folder"
+            exit 1
+          }
+          unzip -Z -l "${zip_path}" | grep -qE '^-rwxr-xr-x.*gpx_opensearch-datasource_' || {
+            echo "::error::backend binaries in ${ZIP_NAME} are not executable"
+            exit 1
+          }
+
+          cd dist-artifacts
+          expected=$(tr -d '\n' < "${ZIP_NAME}.sha1")
+          actual=$(sha1sum "${ZIP_NAME}" | cut -f1 -d' ')
+          if [ "${expected}" != "${actual}" ]; then
+            echo "::error::sha1 mismatch for ${ZIP_NAME}: ${actual} != ${expected}"
+            exit 1
+          fi
+          ls -l
+
+      - name: Upload package as workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-artifacts
+          path: dist-artifacts/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create release
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP_NAME: ${{ steps.package.outputs.zip }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::release ${TAG} already exists; pick another version or tag"
+            exit 1
+          fi
+
+          notes=$(mktemp)
+          cat > "${notes}" <<EOF
+          Unofficial build of the Grafana OpenSearch data source from
+          \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`. Not affiliated with or endorsed by
+          Grafana Labs.
+
+          ## Installation
+
+          The plugin is **not signed**, so Grafana only loads it when unsigned
+          plugins are permitted:
+
+          - \`app_mode = development\`, **or**
+          - in \`grafana.ini\`:
+
+            \`\`\`ini
+            [plugins]
+            allow_loading_unsigned_plugins = grafana-opensearch-datasource
+            \`\`\`
+
+          The archive contains a top-level \`grafana-opensearch-datasource/\` folder,
+          so unzip it into the plugins directory and restart Grafana:
+
+          \`\`\`bash
+          unzip ${ZIP_NAME} -d /var/lib/grafana/plugins
+          \`\`\`
+
+          This replaces the catalog version of \`grafana-opensearch-datasource\`; do
+          not install both. Plugin auto-update may overwrite it.
+
+          ## Verification
+
+          The \`.sha1\` asset contains only the hash, so compare it directly:
+
+          \`\`\`bash
+          sha1sum ${ZIP_NAME} | cut -f1 -d' '
+          cat ${ZIP_NAME}.sha1
+          \`\`\`
+
+          Apache-2.0, same as upstream (see LICENSE).
+          EOF
+
+          args=(--title "v${VERSION}" --notes-file "${notes}")
+          if [ "${PRERELEASE}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            "dist-artifacts/${ZIP_NAME}" \
+            "dist-artifacts/${ZIP_NAME}.sha1" \
+            "dist-artifacts/${ZIP_NAME}.md5" \
+            "${args[@]}"
+
+      - name: Summary
+        if: always()
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP_NAME: ${{ steps.package.outputs.zip }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          {
+            echo "### Fork release build"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Package | \`${ZIP_NAME}\` |"
+            echo "| Published | $([ "${DRY_RUN}" = "true" ] && echo "no (dry run)" || echo "yes") |"
+            echo
+            echo "Unsigned build: install with \`app_mode = development\` or"
+            echo "\`allow_loading_unsigned_plugins = grafana-opensearch-datasource\`."
+          } >> "$GITHUB_STEP_SUMMARY"
