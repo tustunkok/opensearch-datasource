@@ -14,9 +14,11 @@ on:
     inputs:
       source-ref:
         description: >
-          Branch, tag or commit to build. Leave empty to build the ref this
-          workflow was dispatched from. Use this to build a feature branch
-          without that branch having to carry this workflow file.
+          Branch, tag or full 40-character commit SHA to build. Leave empty to
+          build the ref this workflow was dispatched from. Use this to build a
+          feature branch without that branch having to carry this workflow file.
+          Abbreviated SHAs are not supported; actions/checkout only recognizes a
+          SHA at full length and otherwise treats it as a branch name.
         required: false
         type: string
         default: ''
