@@ -84,6 +84,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SOURCE_REF: ${{ inputs.source-ref }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_VERSION}" ]; then
@@ -107,9 +108,14 @@ jobs:
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # checkout leaves a detached HEAD for tags and shas, so fall back to the
+          # requested ref before asking git what the branch is called.
+          head_ref=$(git rev-parse --abbrev-ref HEAD)
+          if [ "${head_ref}" = "HEAD" ]; then head_ref="${INPUT_SOURCE_REF:-${GITHUB_SHA}}"; fi
+
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "built-ref=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: ${version} (tag: ${tag})"
+          echo "built-ref=${head_ref}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${version} (tag: ${tag}), building ${head_ref} at $(git rev-parse --short HEAD)"
 
       - name: Stamp plugin version
         env:
@@ -272,7 +278,9 @@ jobs:
           Apache-2.0, same as upstream (see LICENSE).
           EOF
 
-          args=(--title "v${VERSION}" --notes-file "${notes}")
+          # --target matters: without it the tag is created on the default branch HEAD
+          # rather than on the commit that was actually built.
+          args=(--title "v${VERSION}" --notes-file "${notes}" --target "${BUILT_SHA}")
           if [ "${PRERELEASE}" = "true" ]; then
             args+=(--prerelease)
           fi
